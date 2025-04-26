@@ -1,165 +1,165 @@
+import asyncio
+from abc import ABC, abstractmethod
+from asyncio import TaskGroup
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import Self
 
 from blessed import Terminal
 
-
-def write(*args: object) -> None:
-    """Wrapper over the `print` function that sets the `end` argument to `None`
-    and flushes the buffer immediately."""
-
-    print(*args, end="", flush=True)
+from .msg import (
+    BlockPlacedMessage,
+    BlockRemovedMessage,
+    Message,
+)
 
 
 @dataclass
 class Canvas:
     blocks: set[tuple[int, int]] = field(default_factory=set)
-    size: tuple[int, int] = (50, 20)
-    cursor: tuple[int, int] = (0, 0)
 
-    def move_cursor(self, dx: int, dy: int) -> set[tuple[int, int]]:
-        """Move the cursor by the given offsets, clamping the result within the
-        canvas bounds.
+    def toggle_block(self, x: int, y: int) -> BlockPlacedMessage | BlockRemovedMessage:
+        """Toggles the block at the specified coordinates.
 
         Returns:
-            A set of positions that should be rerendered after the update.
+            A message representing the update.
         """
 
-        width, height = self.size
-        x, y = self.cursor
-        new_x = max(0, min(width - 1, x + dx))
-        new_y = max(0, min(height - 1, y + dy))
-        self.cursor = (new_x, new_y)
+        if (x, y) in self.blocks:
+            self.blocks.remove((x, y))
+            return BlockRemovedMessage(x=x, y=y)
 
-        if (x, y) != self.cursor:
-            return set([(x, y), self.cursor])
-        else:
-            return set()
+        self.blocks.add((x, y))
+        return BlockPlacedMessage(x=x, y=y)
 
-    def toggle_block(self) -> set[tuple[int, int]]:
-        """Toggles the block pointed by the cursor.
+    def add_block(self, x: int, y: int) -> None:
+        """Marks the block at the coordinates as painted."""
+        self.blocks.add((x, y))
+
+    def remove_block(self, x: int, y: int) -> None:
+        """Removes the block at the coordinates from painted blocks."""
+        self.blocks.remove((x, y))
+
+
+class Channel(ABC):
+    @abstractmethod
+    async def read(self) -> list[Message] | None:
+        """Reads all queued messages from the channel.
 
         Returns:
-            A set of positions that should be rerendered after the update."""
+            A list of queued messages or None if the channel is closed.
+        """
 
-        if self.cursor in self.blocks:
-            self.blocks.remove(self.cursor)
-        else:
-            self.blocks.add(self.cursor)
-
-        return set([self.cursor])
+    @abstractmethod
+    async def write(self, msg: Message) -> None:
+        """Writes the message to the channel."""
 
 
-class CanvasController:
-    """Manages a printable canvas in a terminal window.
+def write(*args: object) -> None:
+    """Wrapper over the `print` function that sets the `end` argument to `None`
+    and flushes the buffer immediately."""
+    print(*args, end="", flush=True)
 
-    Canvas can be controlled by a user through the following actions:
 
-    - 'w': Move the cursor up.
-    - 'd': Move the cursor to the right.
-    - 's': Move the cursor down.
-    - 'a': Move the cursor to the left.
-    - ' ' (space): Toggles a block at the current cursor position.
-    """
-
+class BlessedCommandChannel(Channel):
     def __init__(
         self,
         *,
-        term: Terminal = Terminal(),
-        canvas: Canvas = Canvas(blocks=set()),
+        term: Terminal | None = None,
+        width=50,
+        height=20,
         cursor="█",
         block="█",
-    ) -> None:
+    ):
         self._stack = ExitStack()
-        self.term = term
-        self.canvas = canvas
-        self.cursor = cursor
-        self.block = block
-        self._quitting = False
+        self._executor = ThreadPoolExecutor(1)
+        self._canvas = Canvas()
+        self.term = term if term is not None else Terminal()
+        self.width = width
+        self.height = height
+        self.cursor_ch = cursor
+        self.block_ch = block
+        self.x = 0
+        self.y = 0
 
     def __enter__(self) -> Self:
         self._stack.enter_context(self.term.cbreak())
         self._stack.enter_context(self.term.hidden_cursor())
+        write(self.term.clear)
+        self._render((self.x, self.y))
         return self
 
-    def __exit__(self, *args: any) -> None:
+    def __exit__(self, *args):
         self._stack.close()
 
-    def start(self) -> None:
-        """Starts an event loop, handles user input and updates the canvas until
-        user requests to close the program."""
+    async def read(self):
+        while True:
+            key = await asyncio.get_event_loop().run_in_executor(
+                self._executor, lambda: self.term.inkey()
+            )
+            if key == "q":
+                return None
 
-        write(self.term.clear)
+            cmd = self._handle_key(key)
+            if cmd != None:
+                return [cmd]
 
-        # Show the cursor before the first user keypress
-        self._render(set([self.canvas.cursor]))
-
-        while not self._quitting:
-            self.update()
-
-    def update(self) -> None:
-        """Updates the canvas state based on user's input and rerenders it."""
-
-        key = self.term.inkey()
-
-        if key == "q":
-            self._quitting = True
-            return
-
-        updates = self._update_cursor(key)
-        updates = updates.union(self._update_blocks(key))
-        self._render(updates)
-
-    def _update_cursor(self, key: str) -> set[tuple[int, int]]:
-        """Updates the cursor position if the key is one of the movement keys.
-
-        Returns:
-            A set of updated positions."""
-
-        velocity = (0, 0)
+    def _handle_key(self, key: str) -> Message | None:
         match key:
+            case " ":
+                return self._canvas.toggle_block(self.x, self.y)
             case "w":
-                velocity = (0, -1)
-            case "s":
-                velocity = (0, 1)
-            case "a":
-                velocity = (-1, 0)
+                self._move_cursor(0, -1)
             case "d":
-                velocity = (1, 0)
+                self._move_cursor(1, 0)
+            case "s":
+                self._move_cursor(0, 1)
+            case "a":
+                self._move_cursor(-1, 0)
 
-        return self.canvas.move_cursor(*velocity)
+    def _move_cursor(self, dx: int, dy: int) -> None:
+        prev_x, prev_y = self.x, self.y
+        self.x = max(0, min(self.width - 1, prev_x + dx))
+        self.y = max(0, min(self.height - 1, prev_y + dy))
+        if prev_x != self.x or prev_y != self.y:
+            self._render((prev_x, prev_y), (self.x, self.y))
 
-    def _update_blocks(self, key: str) -> set[tuple[int, int]]:
-        """Toggles a block if user pressed the space key.
+    async def write(self, event):
+        match event:
+            case BlockPlacedMessage(x=x, y=y):
+                self._canvas.add_block(x, y)
+                self._render((x, y))
+            case BlockRemovedMessage(x=x, y=y):
+                self._canvas.remove_block(x, y)
+                self._render((x, y))
 
-        Returns:
-            A set of updated positions."""
-
-        if key != " ":
-            return set()
-
-        return self.canvas.toggle_block()
-
-    def _render(self, positions: set[tuple[int, int]]) -> None:
-        """Renders the specified set of positions."""
-
+    def _render(self, *positions: tuple[int, int]) -> None:
         seq = ""
-        for x, y in positions:
-            seq += self._render_sequence(x, y)
+        for pos in positions:
+            seq += self.term.move_xy(*pos) + self._char_at(*pos)
         write(seq)
 
-    def _render_sequence(self, x: int, y: int) -> str:
-        """Creates a render sequence for the specified point."""
-
-        if self.canvas.cursor == (x, y):
-            return self.term.move_xy(x, y) + self.term.blink(self.cursor)
-        elif (x, y) in self.canvas.blocks:
-            return self.term.move_xy(x, y) + self.term.teal(self.block)
+    def _char_at(self, x: int, y: int) -> str:
+        if self.x == x and self.y == y:
+            return self.term.blink(self.cursor_ch)
+        elif (x, y) in self._canvas.blocks:
+            return self.term.teal(self.block_ch)
         else:
-            return self.term.move_xy(x, y) + " "
+            return " "
+
+
+async def run() -> None:
+    with BlessedCommandChannel() as channel:
+        while True:
+            events = await channel.read()
+            if events is None:
+                break
+
+            async with TaskGroup() as group:
+                for event in events:
+                    group.create_task(channel.write(event))
 
 
 def main() -> None:
-    with CanvasController() as canvas:
-        canvas.start()
+    asyncio.run(run())
