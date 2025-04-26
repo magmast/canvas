@@ -89,7 +89,7 @@ class BlessedChannel(Channel):
         block="█",
     ):
         self._stack = ExitStack()
-        self._executor = ThreadPoolExecutor(1)
+        self._executor = ThreadPoolExecutor()
         self._canvas = Canvas()
         self._closed = False
         self.term = term if term is not None else Terminal()
@@ -115,9 +115,13 @@ class BlessedChannel(Channel):
             return None
 
         while True:
-            key = await asyncio.get_event_loop().run_in_executor(
-                self._executor, lambda: self.term.inkey()
-            )
+            try:
+                key = await asyncio.get_event_loop().run_in_executor(
+                    self._executor, lambda: self.term.inkey()
+                )
+            except asyncio.CancelledError:
+                continue
+
             if key == "q":
                 self._closed = True
                 return None
