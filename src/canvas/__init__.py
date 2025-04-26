@@ -1,18 +1,29 @@
 import asyncio
+import os
+import uuid
 from abc import ABC, abstractmethod
-from asyncio import TaskGroup
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import Self
 
 from blessed import Terminal
+from dotenv import load_dotenv
+from pubnub.models.consumer.pubsub import PNMessageResult
+from pubnub.pnconfiguration import PNConfiguration
+from pubnub.pubnub import PubNub
 
-from .msg import (
-    BlockPlacedMessage,
-    BlockRemovedMessage,
-    Message,
-)
+from .msg import BlockPlacedMessage, BlockRemovedMessage, Message, message_adapter
+
+load_dotenv()
+
+PUBNUB_PUBLISH_KEY = os.getenv("PUBNUB_PUBLISH_KEY")
+assert PUBNUB_PUBLISH_KEY is not None
+
+PUBNUB_SUBSCRIBE_KEY = os.getenv("PUBNUB_SUBSCRIBE_KEY")
+assert PUBNUB_SUBSCRIBE_KEY is not None
+
+PUBNUB_CHANNEL_NAME = "messages"
 
 
 @dataclass
@@ -20,7 +31,8 @@ class Canvas:
     blocks: set[tuple[int, int]] = field(default_factory=set)
 
     def toggle_block(self, x: int, y: int) -> BlockPlacedMessage | BlockRemovedMessage:
-        """Toggles the block at the specified coordinates.
+        """
+        Toggles the block at the specified coordinates.
 
         Returns:
             A message representing the update.
@@ -57,12 +69,16 @@ class Channel(ABC):
 
 
 def write(*args: object) -> None:
-    """Wrapper over the `print` function that sets the `end` argument to `None`
-    and flushes the buffer immediately."""
+    """
+    Wrapper over the `print` function that sets the `end` argument to `None`
+    and flushes the buffer immediately.
+    """
     print(*args, end="", flush=True)
 
 
-class BlessedCommandChannel(Channel):
+class BlessedChannel(Channel):
+    """Channel that reads and writes to a user terminal window."""
+
     def __init__(
         self,
         *,
@@ -75,6 +91,7 @@ class BlessedCommandChannel(Channel):
         self._stack = ExitStack()
         self._executor = ThreadPoolExecutor(1)
         self._canvas = Canvas()
+        self._closed = False
         self.term = term if term is not None else Terminal()
         self.width = width
         self.height = height
@@ -94,11 +111,15 @@ class BlessedCommandChannel(Channel):
         self._stack.close()
 
     async def read(self):
+        if self._closed:
+            return None
+
         while True:
             key = await asyncio.get_event_loop().run_in_executor(
                 self._executor, lambda: self.term.inkey()
             )
             if key == "q":
+                self._closed = True
                 return None
 
             cmd = self._handle_key(key)
@@ -149,17 +170,84 @@ class BlessedCommandChannel(Channel):
             return " "
 
 
-async def run() -> None:
-    with BlessedCommandChannel() as channel:
-        while True:
-            events = await channel.read()
-            if events is None:
-                break
+class PubNubChannel(Channel):
+    """Channel that reads and writes messages to a PubNub channel."""
 
-            async with TaskGroup() as group:
-                for event in events:
-                    group.create_task(channel.write(event))
+    def __init__(self):
+        config = PNConfiguration()
+        config.subscribe_key = PUBNUB_SUBSCRIBE_KEY
+        config.publish_key = PUBNUB_PUBLISH_KEY
+        config.ssl = True
+        config.enable_subscribe = True
+        config.daemon = True
+        config.user_id = str(uuid.uuid4())
+
+        self.pubnub = PubNub(config)
+        self.user_id = config.user_id
+        self.queue: list[Message] = []
+
+    def __enter__(self) -> Self:
+        subscription = self.pubnub.channel(PUBNUB_CHANNEL_NAME).subscription()
+        subscription.on_message = self._handle_message
+        subscription.subscribe()
+        return self
+
+    def __exit__(self, *args):
+        self.pubnub.stop()
+
+    async def write(self, msg):
+        data = message_adapter.dump_python(msg)
+        self.pubnub.publish().channel(PUBNUB_CHANNEL_NAME).message(data).sync()
+
+    async def read(self):
+        while not self.queue:
+            await asyncio.sleep(1 / 60)
+        msgs = self.queue
+        self.queue = []
+        return msgs
+
+    def _handle_message(self, result: PNMessageResult) -> None:
+        if result.publisher == self.user_id:
+            return
+        msg = message_adapter.validate_python(result.message)
+        self.queue.append(msg)
+
+
+async def _race(channels: list[Channel]) -> tuple[Channel, list[Message] | None]:
+    """
+    Waits for the first message to be received from any of the given channels.
+    This asynchronous function concurrently reads from multiple channels and
+    returns as soon as the first message is received from any channel. It
+    cancels all other pending read operations once a message is received.
+    """
+
+    tasks = {asyncio.create_task(ch.read()): ch for ch in channels}
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    for task in pending:
+        task.cancel()
+    done_task = done.pop()
+    msgs = await done_task
+    sender = tasks[done_task]
+    return sender, msgs
+
+
+async def _forward(channels: list[Channel], sender: Channel, msgs: list[Message]):
+    for ch in channels:
+        if ch is sender:
+            continue
+        for msg in msgs:
+            asyncio.create_task(ch.write(msg))
+
+
+async def _run() -> None:
+    with BlessedChannel() as blessed, PubNubChannel() as pubnub:
+        channels: list[Channel] = [blessed, pubnub]
+        while True:
+            sender, msgs = await _race(channels)
+            if msgs is None:
+                break
+            await _forward(channels, sender, msgs)
 
 
 def main() -> None:
-    asyncio.run(run())
+    asyncio.run(_run())

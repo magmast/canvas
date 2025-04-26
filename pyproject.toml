@@ -5,7 +5,12 @@ description = "Add your description here"
 readme = "README.md"
 authors = [{ name = "Maciej Augustyniak", email = "maciej@augustyniak.app" }]
 requires-python = ">=3.13"
-dependencies = ["blessed>=1.20.0", "pydantic>=2.11.3"]
+dependencies = [
+    "blessed>=1.20.0",
+    "pubnub>=10.3.0",
+    "pydantic>=2.11.3",
+    "python-dotenv>=1.1.0",
+]
 
 [project.scripts]
 canvas = "canvas:main"
